@@ -218,6 +218,15 @@ class Camera2ApiManager(context: Context) : CameraDevice.StateCallback() {
         }
         
         builderInputSurface.set(CaptureRequest.CONTROL_AE_TARGET_FPS_RANGE, bestRange)
+        // TEMPLATE_RECORD lets the HAL pick its own stabilization default, and some turn it
+        // ON -- which crops the field of view (a 1333x1000 crop region of a 1600x1200
+        // sensor on an Echo Show 5) while isVideoStabilizationEnabled still reports false.
+        // Make the request match the flag, so stabilization is only on when asked for.
+        builderInputSurface.set(
+            CaptureRequest.CONTROL_VIDEO_STABILIZATION_MODE,
+            if (isVideoStabilizationEnabled) CaptureRequest.CONTROL_VIDEO_STABILIZATION_MODE_ON
+            else CaptureRequest.CONTROL_VIDEO_STABILIZATION_MODE_OFF
+        )
         this.builderInputSurface = builderInputSurface
         return builderInputSurface.build()
     }
