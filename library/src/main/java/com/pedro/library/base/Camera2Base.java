@@ -50,6 +50,7 @@ import com.pedro.encoder.input.video.CameraOpenException;
 import com.pedro.encoder.input.video.FrameCapturedCallback;
 import com.pedro.encoder.input.video.facedetector.FaceDetectorCallback;
 import com.pedro.encoder.utils.CodecUtil;
+import com.pedro.encoder.utils.gl.AspectRatioMode;
 import com.pedro.encoder.video.FormatVideoEncoder;
 import com.pedro.encoder.video.GetVideoData;
 import com.pedro.encoder.video.VideoEncoder;
@@ -97,6 +98,15 @@ public abstract class Camera2Base {
     protected RecordController recordController;
     private int previewWidth, previewHeight;
     private final FpsListener fpsListener = new FpsListener();
+
+    // Fields for prepareVideoCropped() -- see that method. -1/0 = not in use, fall back
+    // to the normal prepareVideo() behavior everywhere these are read.
+    private int cameraCaptureWidthOverride = 0;
+    private int cameraCaptureHeightOverride = 0;
+    private int glContentRotationOverride = -1;
+    private int contentWidthOverride = 0;
+    private int contentHeightOverride = 0;
+    private boolean cropContentToOutput = false;
 
     public Camera2Base(OpenGlView openGlView) {
         context = openGlView.getContext();
@@ -352,6 +362,65 @@ public abstract class Camera2Base {
     public boolean prepareVideo(int width, int height, int bitrate) {
         int rotation = CameraHelper.getCameraOrientation(context);
         return prepareVideo(width, height, 30, bitrate, 2, rotation);
+    }
+
+    /**
+     * Requests the camera at a genuinely different resolution/aspect ratio than the one
+     * the encoder declares and streams, cropping (never stretching, never padding) to
+     * reconcile the two.
+     *
+     * Exists for sensors whose only clean, undistorted capture modes don't match the
+     * desired output aspect ratio -- e.g. a 4:3-native sensor with a 16:9 desired output.
+     * The normal prepareVideo() always requests the camera at exactly the size it
+     * declares to the encoder, and its rotation parameter, when 90 or 270, only ever
+     * transposes that size (swaps width and height) -- it can correct sideways/upside
+     * down content, but it can never change the picture's *shape*, so on a sensor with no
+     * native mode in the desired aspect ratio, one of (a) requesting the mismatched
+     * aspect ratio directly (which some HALs deliver distorted -- non-uniformly scaled)
+     * or (b) accepting the transposed shape is the only option. This method adds a third:
+     * capture the sensor's real, undistorted native mode, and let the GL layer crop it
+     * down to the desired output shape after correcting orientation.
+     *
+     * @param cameraWidth width requested from the camera -- pick one of its own
+     * supported, undistorted native modes (see CameraCharacteristics
+     * SCALER_STREAM_CONFIGURATION_MAP), not the desired output size.
+     * @param cameraHeight height requested from the camera.
+     * @param outputWidth width the encoder declares and streams. Independent of the
+     * above -- this is never transposed, unlike prepareVideo()'s width/height under
+     * rotation 90/270.
+     * @param outputHeight height the encoder declares and streams.
+     * @param contentRotation GL-space rotation in degrees (0/90/180/270) applied to
+     * camera frames before cropping and encoding, to correct sensor-vs-mount
+     * orientation. This is a different numbering than prepareVideo()'s rotation
+     * parameter (which is fed through an internal offset and additionally controls the
+     * width/height transpose) -- the correct value here is found empirically per
+     * device, the same way prepareVideo()'s rotation parameter is.
+     * @param contentTransposed true if the corrected, upright content's visual shape is
+     * the transpose of the raw camera capture shape (typically true when
+     * contentRotation is 90 or 270) -- controls which axis the crop trims.
+     * @return true if success, false if you get a error (Normally because the encoder
+     * selected doesn't support any configuration seated or your device hasn't a H264
+     * encoder).
+     */
+    public boolean prepareVideoCropped(
+        int cameraWidth, int cameraHeight,
+        int outputWidth, int outputHeight,
+        int fps, int bitrate, int iFrameInterval,
+        int contentRotation, boolean contentTransposed
+    ) {
+        this.cameraCaptureWidthOverride = cameraWidth;
+        this.cameraCaptureHeightOverride = cameraHeight;
+        this.glContentRotationOverride = contentRotation;
+        this.contentWidthOverride = contentTransposed ? cameraHeight : cameraWidth;
+        this.contentHeightOverride = contentTransposed ? cameraWidth : cameraHeight;
+        this.cropContentToOutput = true;
+        differentRecordResolution = false;
+        // rotation=0 here, always: prepareVideoEncoder() transposes width/height itself
+        // whenever this is 90 or 270, which is exactly the behavior outputWidth/
+        // outputHeight above exist to avoid. Orientation is corrected separately, in GL,
+        // via contentRotation.
+        return videoEncoder.prepareVideoEncoder(outputWidth, outputHeight, fps, bitrate, 0,
+                iFrameInterval, FormatVideoEncoder.SURFACE, -1, -1);
     }
 
     protected abstract void onAudioInfoImp(boolean isStereo, int sampleRate);
@@ -685,8 +754,15 @@ public abstract class Camera2Base {
         if (glInterface instanceof GlStreamInterface glStreamInterface) {
             glStreamInterface.setPreviewResolution(w, h);
             glStreamInterface.setIsPortrait(isPortrait);
+            if (cropContentToOutput) {
+                glStreamInterface.setContentSize(contentWidthOverride, contentHeightOverride);
+                glStreamInterface.setStreamFillMode(AspectRatioMode.Fill);
+            } else {
+                glStreamInterface.setStreamFillMode(AspectRatioMode.NONE);
+            }
         }
-        glInterface.setRotation(rotation == 0 ? 270 : rotation - 90);
+        glInterface.setRotation(glContentRotationOverride != -1 ? glContentRotationOverride
+                : (rotation == 0 ? 270 : rotation - 90));
         if (!glInterface.isRunning()) glInterface.start();
         if (videoEncoder.getInputSurface() != null && videoEncoder.isRunning()) {
             glInterface.addMediaCodecSurface(videoEncoder.getInputSurface());
@@ -694,8 +770,10 @@ public abstract class Camera2Base {
         if (videoEncoderRecord.getInputSurface() != null && videoEncoderRecord.isRunning()) {
             glInterface.addMediaCodecRecordSurface(videoEncoderRecord.getInputSurface());
         }
-        int cameraWidth = Math.max(videoEncoder.getWidth(), videoEncoderRecord.getWidth());
-        int cameraHeight = Math.max(videoEncoder.getHeight(), videoEncoderRecord.getHeight());
+        int cameraWidth = cameraCaptureWidthOverride != 0 ? cameraCaptureWidthOverride
+                : Math.max(videoEncoder.getWidth(), videoEncoderRecord.getWidth());
+        int cameraHeight = cameraCaptureHeightOverride != 0 ? cameraCaptureHeightOverride
+                : Math.max(videoEncoder.getHeight(), videoEncoderRecord.getHeight());
         cameraManager.prepareCamera(glInterface.getSurfaceTexture(), cameraWidth, cameraHeight, videoEncoder.getFps());
     }
 
