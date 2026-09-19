@@ -48,10 +48,12 @@ class H264PacketTest {
     h264Packet.createAndSendPacket(mediaFrame) { frames.addAll(it) }
 
     val expectedRtp = byteArrayOf(-128, -32, 0, 2, 0, -87, -118, -57, 7, 91, -51, 21, 5).plus(fakeH264.copyOfRange(header.size, fakeH264.size))
-    val expectedStapA = byteArrayOf(-128, -32, 0, 1, 0, -87, -118, -57, 7, 91, -51, 21, 24, 0, 7, 0, 0, 0, 1, 2, 3, 4, 0, 7, 0, 0, 0, 1, 10, 11, 12)
+    // STAP-A: header 24, then [size][NAL] per unit. NAL units carry no start code:
+    // a start code inside a unit makes depacketizers emit an empty NAL before it.
+    val expectedStapA = byteArrayOf(-128, -32, 0, 1, 0, -87, -118, -57, 7, 91, -51, 21, 24, 0, 3, 2, 3, 4, 0, 3, 10, 11, 12)
     val expectedTimeStamp = 11111111L
     val expectedSize = RtpConstants.RTP_HEADER_LENGTH + 1 + info.size - header.size
-    val expectedStapAResult = RtpFrame(expectedStapA, expectedTimeStamp, fakePps.size + fakePps.size + 5 + RtpConstants.RTP_HEADER_LENGTH, RtpConstants.trackVideo)
+    val expectedStapAResult = RtpFrame(expectedStapA, expectedTimeStamp, 3 + 3 + 5 + RtpConstants.RTP_HEADER_LENGTH, RtpConstants.trackVideo)
     val expectedPacketResult = RtpFrame(expectedRtp, expectedTimeStamp, expectedSize, RtpConstants.trackVideo)
 
     assertNotEquals(0, frames.size)
@@ -81,11 +83,13 @@ class H264PacketTest {
     val expectedRtp = byteArrayOf(-128, 96, 0, 2, 0, -87, -118, -57, 7, 91, -51, 21, 28, -123).plus(chunk1)
     val expectedRtp2 = byteArrayOf(-128, -32, 0, 3, 0, -87, -118, -57, 7, 91, -51, 21, 28, 69).plus(chunk2)
 
-    val expectedStapA = byteArrayOf(-128, -32, 0, 1, 0, -87, -118, -57, 7, 91, -51, 21, 24, 0, 7, 0, 0, 0, 1, 2, 3, 4, 0, 7, 0, 0, 0, 1, 10, 11, 12)
+    // STAP-A: header 24, then [size][NAL] per unit. NAL units carry no start code:
+    // a start code inside a unit makes depacketizers emit an empty NAL before it.
+    val expectedStapA = byteArrayOf(-128, -32, 0, 1, 0, -87, -118, -57, 7, 91, -51, 21, 24, 0, 3, 2, 3, 4, 0, 3, 10, 11, 12)
     val expectedTimeStamp = 11111111L
     val expectedSize = chunk1.size + RtpConstants.RTP_HEADER_LENGTH + 2
     val expectedSize2 = chunk2.size + RtpConstants.RTP_HEADER_LENGTH + 2
-    val expectedStapAResult = RtpFrame(expectedStapA, expectedTimeStamp, fakePps.size + fakePps.size + 5 + RtpConstants.RTP_HEADER_LENGTH, RtpConstants.trackVideo)
+    val expectedStapAResult = RtpFrame(expectedStapA, expectedTimeStamp, 3 + 3 + 5 + RtpConstants.RTP_HEADER_LENGTH, RtpConstants.trackVideo)
 
     val expectedPacketResult = RtpFrame(expectedRtp, expectedTimeStamp, expectedSize, RtpConstants.trackVideo)
     val expectedPacketResult2 = RtpFrame(expectedRtp2, expectedTimeStamp, expectedSize2, RtpConstants.trackVideo)

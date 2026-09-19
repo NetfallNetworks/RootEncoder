@@ -22,6 +22,7 @@ import com.pedro.common.removeInfo
 import com.pedro.common.toByteArray
 import com.pedro.rtsp.rtsp.RtpFrame
 import com.pedro.rtsp.utils.RtpConstants
+import com.pedro.rtsp.utils.getData
 import com.pedro.rtsp.utils.getVideoStartCodeSize
 import java.nio.ByteBuffer
 import kotlin.experimental.and
@@ -45,7 +46,12 @@ class H264Packet: BasePacket(RtpConstants.clockVideoFrequency,
   }
 
   fun sendVideoInfo(sps: ByteBuffer, pps: ByteBuffer) {
-    setSpsPps(sps.toByteArray(), pps.toByteArray())
+    // The encoder's SPS/PPS arrive with their 00 00 00 01 start code (see
+    // VideoEncoderHelper.decodeSpsPpsFromBuffer). STAP-A units must be bare NAL units:
+    // with the start code left in, depacketizers emit an empty NAL unit ahead of each,
+    // and recordings of the stream fail to decode at every keyframe. duplicate() so the
+    // shared buffers' positions are left alone. Same fix as upstream master.
+    setSpsPps(sps.duplicate().getData(), pps.duplicate().getData())
   }
 
   override suspend fun createAndSendPacket(
