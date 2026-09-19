@@ -282,8 +282,23 @@ class GlStreamInterface(private val context: Context): OnFrameAvailableListener,
       val w = if (muteVideo) 0 else encoderWidth
       val h = if (muteVideo) 0 else encoderHeight
       if (surfaceManagerEncoder.makeCurrent()) {
-        mainRender.drawScreenEncoder(w, h, orientation, streamOrientation,
-          isStreamVerticalFlip, isStreamHorizontalFlip, streamViewPort)
+        if (streamFillMode != AspectRatioMode.NONE && contentWidth > 0 && contentHeight > 0) {
+          // calculateViewPortEncoder (drawScreenEncoder's own sizing) only ever pads or
+          // passes through -- it cannot crop a genuine aspect-ratio mismatch between the
+          // corrected content and the declared canvas. drawScreen's AspectRatioMode.Fill
+          // path can, using contentWidth/contentHeight as the content's own true size
+          // rather than assuming it always matches the canvas.
+          mainRender.setStreamSize(contentWidth, contentHeight)
+          mainRender.drawScreen(w, h, streamFillMode, streamOrientation,
+            isStreamVerticalFlip, isStreamHorizontalFlip, streamViewPort)
+          // ScreenRender's streamWidth/streamHeight is one shared field read by every
+          // draw call this frame, including the preview block further down -- restore
+          // it immediately so that block still sees the real encoder size, not ours.
+          mainRender.setStreamSize(encoderWidth, encoderHeight)
+        } else {
+          mainRender.drawScreenEncoder(w, h, orientation, streamOrientation,
+            isStreamVerticalFlip, isStreamHorizontalFlip, streamViewPort)
+        }
         surfaceManagerEncoder.setPresentationTime(mainRender.getSurfaceTexture().timestamp)
         surfaceManagerEncoder.swapBuffer()
       }
@@ -553,6 +568,28 @@ class GlStreamInterface(private val context: Context): OnFrameAvailableListener,
 
   fun setAspectRatioMode(aspectRatioMode: AspectRatioMode) {
     this.aspectRatioMode = aspectRatioMode
+  }
+
+  /**
+   * The upright, corrected-orientation content's own true size, independent of
+   * [encoderWidth]/[encoderHeight] (the declared output canvas). Only consulted when
+   * [streamFillMode] is not [AspectRatioMode.NONE]. Needed because the stream/encoder
+   * draw path otherwise treats "content size" and "canvas size" as the same thing (see
+   * [draw]), which cannot express a real aspect-ratio mismatch between what the camera
+   * captures and what the encoder declares -- e.g. a 4:3 capture cropped down to a 16:9
+   * output.
+   */
+  private var contentWidth = 0
+  private var contentHeight = 0
+  private var streamFillMode = AspectRatioMode.NONE
+
+  fun setContentSize(width: Int, height: Int) {
+    contentWidth = width
+    contentHeight = height
+  }
+
+  fun setStreamFillMode(mode: AspectRatioMode) {
+    streamFillMode = mode
   }
 
   fun setPreviewViewPort(viewPort: ViewPort?) {

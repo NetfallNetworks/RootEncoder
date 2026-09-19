@@ -77,6 +77,17 @@ class MainRender {
       flipStreamHorizontal, viewPort)
   }
 
+  /**
+   * Overrides the content size used by [drawScreen]'s [AspectRatioMode] crop/fit math,
+   * independent of the encoder size passed to [initGl]. Both draw onto the same
+   * [ScreenRender], which keeps a single shared streamWidth/streamHeight -- callers that
+   * mutate this for one draw call must restore it before any other draw call in the same
+   * frame relies on the original value.
+   */
+  fun setStreamSize(width: Int, height: Int) {
+    screenRender.setStreamSize(width, height)
+  }
+
   fun drawScreenEncoder(
     width: Int, height: Int, isPortrait: Boolean, rotation: Int,
     flipStreamVertical: Boolean, flipStreamHorizontal: Boolean, viewPort: ViewPort?
