@@ -91,6 +91,13 @@ class Camera2ApiManager(context: Context) : CameraDevice.StateCallback() {
         private set
     var isOpticalStabilizationEnabled: Boolean = false
         private set
+    // Requests the standard android.control.availableSceneModes HDR mode (scene mode 18).
+    // Off by default: USE_SCENE_MODE overrides AE/AWB behaviour (see enableHdrSceneMode),
+    // and not every scene benefits from it (e.g. a low dynamic-range indoor test showed no
+    // visible effect) -- it should only run where the caller actually wants it, such as a
+    // camera pointed at a bright sky against a dark porch.
+    var isHdrSceneModeEnabled: Boolean = false
+        private set
     var isAutoFocusEnabled: Boolean = true
         private set
     var isAutoExposureEnabled: Boolean = false
@@ -192,7 +199,16 @@ class Camera2ApiManager(context: Context) : CameraDevice.StateCallback() {
     private fun drawSurface(cameraDevice: CameraDevice, surfaces: List<Surface>): CaptureRequest {
         val builderInputSurface = cameraDevice.createCaptureRequest(CameraDevice.TEMPLATE_RECORD)
         for (surface in surfaces) builderInputSurface.addTarget(surface)
-        builderInputSurface.set(CaptureRequest.CONTROL_MODE, CameraMetadata.CONTROL_MODE_AUTO)
+        // CONTROL_SCENE_MODE only takes effect when CONTROL_MODE is USE_SCENE_MODE, so the
+        // two are set together here and re-derived from isHdrSceneModeEnabled on every
+        // prepare, the same way CONTROL_VIDEO_STABILIZATION_MODE is re-derived below.
+        if (isHdrSceneModeEnabled) {
+            builderInputSurface.set(CaptureRequest.CONTROL_MODE, CameraMetadata.CONTROL_MODE_USE_SCENE_MODE)
+            builderInputSurface.set(CaptureRequest.CONTROL_SCENE_MODE, CaptureRequest.CONTROL_SCENE_MODE_HDR)
+        } else {
+            builderInputSurface.set(CaptureRequest.CONTROL_MODE, CameraMetadata.CONTROL_MODE_AUTO)
+            builderInputSurface.set(CaptureRequest.CONTROL_SCENE_MODE, CaptureRequest.CONTROL_SCENE_MODE_DISABLED)
+        }
         val validFps = min(60, fps)
         // Find best FPS range instead of forcing strict [30, 30] which causes HAL duplication stutter
         var bestRange = Range(validFps, validFps)
@@ -455,6 +471,32 @@ class Camera2ApiManager(context: Context) : CameraDevice.StateCallback() {
         builderInputSurface.set(CaptureRequest.CONTROL_VIDEO_STABILIZATION_MODE, CaptureRequest.CONTROL_VIDEO_STABILIZATION_MODE_OFF)
         applyRequest(builderInputSurface)
         isVideoStabilizationEnabled = false
+    }
+
+    /**
+     * Request the standard CONTROL_SCENE_MODE_HDR scene mode (android.control.availableSceneModes
+     * value 18). This forces CONTROL_MODE to USE_SCENE_MODE, which lets the HDR scene mode take
+     * effect but also hands AE/AWB behaviour to the scene mode implementation -- manual exposure/
+     * white-balance calls made while this is enabled may be overridden or ignored by the HAL.
+     * @return true if success, false if fail (not supported, or called before start camera)
+     */
+    fun enableHdrSceneMode(): Boolean {
+        val characteristics = cameraCharacteristics ?: return false
+        val builderInputSurface = this.builderInputSurface ?: return false
+        val modes = characteristics.secureGet(CameraCharacteristics.CONTROL_AVAILABLE_SCENE_MODES) ?: return false
+        if (!modes.contains(CaptureRequest.CONTROL_SCENE_MODE_HDR)) return false
+        builderInputSurface.set(CaptureRequest.CONTROL_MODE, CameraMetadata.CONTROL_MODE_USE_SCENE_MODE)
+        builderInputSurface.set(CaptureRequest.CONTROL_SCENE_MODE, CaptureRequest.CONTROL_SCENE_MODE_HDR)
+        isHdrSceneModeEnabled = applyRequest(builderInputSurface)
+        return isHdrSceneModeEnabled
+    }
+
+    fun disableHdrSceneMode() {
+        val builderInputSurface = this.builderInputSurface ?: return
+        builderInputSurface.set(CaptureRequest.CONTROL_MODE, CameraMetadata.CONTROL_MODE_AUTO)
+        builderInputSurface.set(CaptureRequest.CONTROL_SCENE_MODE, CaptureRequest.CONTROL_SCENE_MODE_DISABLED)
+        applyRequest(builderInputSurface)
+        isHdrSceneModeEnabled = false
     }
 
     fun enableOpticalVideoStabilization(): Boolean {
