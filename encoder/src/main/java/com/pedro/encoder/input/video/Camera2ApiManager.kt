@@ -64,10 +64,10 @@ import kotlin.math.roundToInt
  * (21.74 -> 20.19), consistent with auto-exposure settling rather than any HDR effect.
  *
  * CaptureRequest.Key/CaptureResult.Key/CameraCharacteristics.Key all have public constructors
- * taking a vendor tag name and type -- that's the supported route for vendor keys, and equality
- * for these Key types is by (name, type), so a freshly-constructed Key can be looked up in
- * CameraCharacteristics.getAvailableSessionKeys() / getAvailableCaptureRequestKeys() / getKeys()
- * to confirm the HAL actually exposes it before ever calling get()/set() with it.
+ * taking a vendor tag name and type -- that's the supported route for vendor keys. Availability
+ * MUST be checked by NAME, not by Key.equals() against getAvailableSessionKeys() /
+ * getAvailableCaptureRequestKeys() -- see hasVendorTagNamed() below for why: a naive
+ * `.contains(ourKey)` looked right, compiled, and was wrong on the one device that mattered.
  *
  * hdrMode vs SessionParamhdrMode: the "SessionParam" prefix is MediaTek's own naming convention
  * for tags that only show up in getAvailableSessionKeys() (as opposed to
@@ -92,12 +92,38 @@ import kotlin.math.roundToInt
  * tag the MediaTek library defines, not what this specific camera reports. So the "read the on
  * value from a characteristic" path never fires here, and MTK_HDR_FALLBACK_ON_VALUE is what
  * actually gets written on this device -- see mtkHdrOnValue().
+ *
+ * On-device evidence of the Key.equals()-by-type bug, from the SAME device: the very first
+ * on-device run logged "hdrMode not available on this device; skipped" for BOTH hdrMode and
+ * SessionParamhdrMode, even though dumpsys showed 0x80030000 (hdrMode) present in
+ * android.request.availableRequestKeys. hdrMode's Key here is constructed with Int::class.java
+ * (primitive int.class -- see below), but the framework's own Key objects returned by
+ * getAvailableCaptureRequestKeys() for a vendor int32 tag are typed java.lang.Integer (boxed) --
+ * they have to be, a reference type is required for a Java generic. int.class != Integer.class,
+ * so Key.equals() (which compares name AND type) always returned false for a tag that WAS
+ * present, and every `.contains(ourKey)` check below silently failed shut. hasVendorTagNamed()
+ * fixes this by comparing only the tag name, which is the stable identifier for a vendor tag --
+ * the type of the framework's own Key object is an implementation detail we should never have
+ * been asserting on. (SessionParamhdrMode's "not available" was correct independently -- dumpsys
+ * confirmed it is genuinely absent from android.request.availableSessionKeys on this device --
+ * so only the hdrMode diagnosis changes here.)
  */
 private object MtkHdrVendorTags {
     // Per-request: android.control.mode-style toggle, changeable live via setRepeatingRequest().
     // Explicit <Int> + Int::class.java (not Integer::class.java): passing the primitive Class<Int>
     // to the Java Key<T>(String, Class<T>) constructor with T pinned to Kotlin's Int lets every
-    // get()/set()/contains() call site below use plain Kotlin Int, with no manual boxing.
+    // get()/set() call site below use plain Kotlin Int, with no manual boxing.
+    //
+    // IMPORTANT, and not a typo: this Int::class.java (int.class) spelling is deliberately kept
+    // for get()/set() even though it is exactly what breaks Key.equals()-based availability
+    // checks (see hasVendorTagNamed() and the class doc above). get()/set() do not compare
+    // against the framework's enumerated Key list at all -- they resolve the native tag id from
+    // the key's *name* and marshal using the *type we supply*, so int.class works correctly
+    // there. Only equality/contains() against getAvailableCaptureRequestKeys() /
+    // getAvailableSessionKeys() -- which return the framework's OWN Key objects, boxed
+    // Integer.class -- is affected. Changing this to Integer::class.java would not fix the
+    // availability check (name matching does that) and would reintroduce the Class<Integer> vs
+    // Class<Int> compile errors described in the original PR.
     val hdrMode = CaptureRequest.Key<Int>("com.mediatek.hdrfeature.hdrMode", Int::class.java)
     // Session parameter: must be supplied to SessionConfiguration.setSessionParameters() when the
     // CameraCaptureSession is created; cannot be changed without rebuilding that session.
@@ -114,6 +140,24 @@ private object MtkHdrVendorTags {
     // the cb CaptureCallback) so on-device state can be confirmed from the device's own
     // reporting instead of inferring it from pixel statistics.
     val hdrDetectionResult = CaptureResult.Key<Int>("com.mediatek.hdrfeature.hdrDetectionResult", Int::class.java)
+}
+
+/**
+ * Checks whether [name] is advertised in a getAvailableCaptureRequestKeys() /
+ * getAvailableSessionKeys() result, by tag NAME rather than by CaptureRequest.Key.equals().
+ *
+ * Key.equals() compares (name, type). The framework's own Key objects in that list are typed
+ * java.lang.Integer (boxed) for a vendor int32 tag -- they must be, since Key<T> requires a
+ * reference type -- while MtkHdrVendorTags' keys are constructed with Int::class.java (primitive
+ * int.class, kept deliberately for get()/set(), see MtkHdrVendorTags.hdrMode). int.class !=
+ * Integer.class, so a naive `.contains(ourKey)` always returns false even when the tag genuinely
+ * is advertised. This was confirmed on-device: hdrMode logged "not available" while dumpsys
+ * showed it present in android.request.availableRequestKeys. Comparing by name sidesteps the
+ * mismatch entirely -- name is the stable identifier for a vendor tag, the type of the
+ * framework's own Key object is an implementation detail this code should not assert on.
+ */
+private fun List<CaptureRequest.Key<*>>?.hasVendorTagNamed(name: String): Boolean {
+    return this?.any { it.name == name } ?: false
 }
 
 // Fallback "on" value for hdrMode/SessionParamhdrMode when the request/session key is advertised
@@ -510,9 +554,16 @@ class Camera2ApiManager(context: Context) : CameraDevice.StateCallback() {
     private fun applyMtkHdrRequestKey(builder: CaptureRequest.Builder, enabled: Boolean) {
         if (Build.VERSION.SDK_INT < Build.VERSION_CODES.P) return
         val characteristics = cameraCharacteristics ?: return
-        val requestKeys = try { characteristics.availableCaptureRequestKeys } catch (_: Exception) { null } ?: return
-        if (!requestKeys.contains(MtkHdrVendorTags.hdrMode)) {
-            Log.d(TAG, "MediaTek vendor com.mediatek.hdrfeature.hdrMode not available on this device; skipped")
+        val requestKeys = try { characteristics.availableCaptureRequestKeys } catch (_: Exception) { null }
+        if (requestKeys == null) {
+            Log.d(TAG, "MediaTek vendor com.mediatek.hdrfeature.hdrMode: could not read this device's " +
+                "available capture request keys; skipped")
+            return
+        }
+        // By name, not requestKeys.contains(MtkHdrVendorTags.hdrMode) -- see hasVendorTagNamed().
+        if (!requestKeys.hasVendorTagNamed(MtkHdrVendorTags.hdrMode.name)) {
+            Log.d(TAG, "MediaTek vendor com.mediatek.hdrfeature.hdrMode not advertised in this device's " +
+                "available capture request keys; skipped")
             return
         }
         val value = if (enabled) {
@@ -544,9 +595,16 @@ class Camera2ApiManager(context: Context) : CameraDevice.StateCallback() {
     @RequiresApi(Build.VERSION_CODES.P)
     private fun buildMtkHdrSessionParams(cameraDevice: CameraDevice): CaptureRequest? {
         val characteristics = cameraCharacteristics ?: return null
-        val sessionKeys = try { characteristics.availableSessionKeys } catch (_: Exception) { null } ?: return null
-        if (!sessionKeys.contains(MtkHdrVendorTags.sessionParamHdrMode)) {
-            Log.d(TAG, "MediaTek vendor com.mediatek.hdrfeature.SessionParamhdrMode not available on this device; skipped")
+        val sessionKeys = try { characteristics.availableSessionKeys } catch (_: Exception) { null }
+        if (sessionKeys == null) {
+            Log.d(TAG, "MediaTek vendor com.mediatek.hdrfeature.SessionParamhdrMode: could not read this " +
+                "device's available session keys; skipped")
+            return null
+        }
+        // By name, not sessionKeys.contains(MtkHdrVendorTags.sessionParamHdrMode) -- see hasVendorTagNamed().
+        if (!sessionKeys.hasVendorTagNamed(MtkHdrVendorTags.sessionParamHdrMode.name)) {
+            Log.d(TAG, "MediaTek vendor com.mediatek.hdrfeature.SessionParamhdrMode not advertised in this " +
+                "device's available session keys; skipped")
             return null
         }
         val value = if (isHdrSceneModeEnabled) {
@@ -589,7 +647,8 @@ class Camera2ApiManager(context: Context) : CameraDevice.StateCallback() {
         if (!isRunning) return
         val characteristics = cameraCharacteristics ?: return
         val sessionKeys = try { characteristics.availableSessionKeys } catch (_: Exception) { null } ?: return
-        if (!sessionKeys.contains(MtkHdrVendorTags.sessionParamHdrMode)) return
+        // By name, not sessionKeys.contains(MtkHdrVendorTags.sessionParamHdrMode) -- see hasVendorTagNamed().
+        if (!sessionKeys.hasVendorTagNamed(MtkHdrVendorTags.sessionParamHdrMode.name)) return
         Log.i(TAG, "MediaTek vendor SessionParamhdrMode is session-only on this device; rebuilding the capture " +
             "session so the HDR toggle takes effect")
         reOpenCamera(cameraId)
