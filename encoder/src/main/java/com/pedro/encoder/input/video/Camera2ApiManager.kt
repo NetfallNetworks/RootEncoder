@@ -84,6 +84,14 @@ import kotlin.math.roundToInt
  * Everything here is guarded by an availability check against this device's own
  * CameraCharacteristics before use, so a device that doesn't report these tags (any non-MediaTek
  * device, e.g. a Pixel) never has get()/set() called with them at all.
+ *
+ * On the actual target hardware (Echo Show 5, dumpsys read after this file's first version):
+ * hdrMode *is* listed in android.request.availableRequestKeys (0x80030000 appears there), but
+ * neither availableHdrModesVideo nor availableVhdrModes appears anywhere in this camera's own
+ * CameraCharacteristics -- only in the global vendor tag-definition list, which enumerates every
+ * tag the MediaTek library defines, not what this specific camera reports. So the "read the on
+ * value from a characteristic" path never fires here, and MTK_HDR_FALLBACK_ON_VALUE is what
+ * actually gets written on this device -- see mtkHdrOnValue().
  */
 private object MtkHdrVendorTags {
     // Per-request: android.control.mode-style toggle, changeable live via setRepeatingRequest().
@@ -96,10 +104,34 @@ private object MtkHdrVendorTags {
     val sessionParamHdrMode = CaptureRequest.Key<Int>("com.mediatek.hdrfeature.SessionParamhdrMode", Int::class.java)
     // Static characteristics: the HDR video mode(s) this HAL actually supports. Both are reported
     // as a single int32 (not an array), which reads as "the one non-off mode this HAL supports"
-    // rather than a bitmask, so that value is used verbatim as the "on" state below.
+    // rather than a bitmask, so that value is used verbatim as the "on" state below -- when either
+    // is actually present in this camera's characteristics, which on the target Echo Show 5 it
+    // is not (see class doc above).
     val availableHdrModesVideo = CameraCharacteristics.Key<Int>("com.mediatek.hdrfeature.availableHdrModesVideo", Int::class.java)
     val availableVhdrModes = CameraCharacteristics.Key<Int>("com.mediatek.hdrfeature.availableVhdrModes", Int::class.java)
+    // Read-only CaptureResult key: the HAL's own report of whether HDR is actually engaged.
+    // Wired into the existing per-frame capture callback (see enableMtkHdrDetectionLogging /
+    // the cb CaptureCallback) so on-device state can be confirmed from the device's own
+    // reporting instead of inferring it from pixel statistics.
+    val hdrDetectionResult = CaptureResult.Key<Int>("com.mediatek.hdrfeature.hdrDetectionResult", Int::class.java)
 }
+
+// Fallback "on" value for hdrMode/SessionParamhdrMode when the request/session key is advertised
+// but neither availableHdrModesVideo nor availableVhdrModes supplies a value to read (the exact
+// situation on the Echo Show 5 target hardware: hdrMode is an advertised request key, but no
+// video-mode characteristic is present). 1 is not arbitrary: availableHdrModesPhoto -- the sibling
+// photo-HDR characteristic, which IS present on this hardware -- reports [0, 1], so 1 is what this
+// vendor means by "on" for the sibling feature. Skipping instead of writing a value here would
+// guarantee the on-device measurement this PR exists to enable can never run: a rejected set tells
+// us something (this device doesn't actually support it), a skipped one tells us nothing.
+private const val MTK_HDR_FALLBACK_ON_VALUE = 1
+
+// How often (in frames) to log com.mediatek.hdrfeature.hdrDetectionResult from the capture
+// callback -- confirming HDR engagement from the HAL's own read-only report, instead of only
+// inferring it from pixel statistics as the earlier measurement round had to. Once per frame
+// would spam logcat at 30-60fps for no benefit; once every 90 frames is roughly once every
+// 1.5-3s, frequent enough to catch a toggle without flooding the log.
+private const val MTK_HDR_DETECTION_LOG_EVERY_N_FRAMES = 90
 
 /**
  * Created by pedro on 4/03/17.
@@ -148,6 +180,9 @@ class Camera2ApiManager(context: Context) : CameraDevice.StateCallback() {
     // camera pointed at a bright sky against a dark porch.
     var isHdrSceneModeEnabled: Boolean = false
         private set
+    // Throttle for the com.mediatek.hdrfeature.hdrDetectionResult log in cb.onCaptureCompleted --
+    // logged every N frames rather than every frame, see MTK_HDR_DETECTION_LOG_EVERY_N_FRAMES.
+    private var mtkHdrDetectionLogFrameCounter = 0
     var isAutoFocusEnabled: Boolean = true
         private set
     var isAutoExposureEnabled: Boolean = false
@@ -220,7 +255,10 @@ class Camera2ApiManager(context: Context) : CameraDevice.StateCallback() {
                     try {
                         it.setRepeatingRequest(
                             captureRequest,
-                            if (faceDetectionEnabled || frameCapturedCallback != null || customCaptureCompletedCallback != null) cb else null,
+                            // isHdrSceneModeEnabled included so the hdrDetectionResult log in cb
+                            // actually runs while HDR is on, without requiring face detection /
+                            // frame capture / a custom callback to also be enabled.
+                            if (faceDetectionEnabled || frameCapturedCallback != null || customCaptureCompletedCallback != null || isHdrSceneModeEnabled) cb else null,
                             cameraHandler
                         )
                     } catch (_: IllegalStateException) {
@@ -431,7 +469,9 @@ class Camera2ApiManager(context: Context) : CameraDevice.StateCallback() {
         try {
             cameraCaptureSession.setRepeatingRequest(
                 builder.build(),
-                if (faceDetectionEnabled || frameCapturedCallback != null || customCaptureCompletedCallback != null) cb else null, null
+                // isHdrSceneModeEnabled included so the hdrDetectionResult log in cb actually runs
+                // while HDR is on -- see the matching condition in startPreview().
+                if (faceDetectionEnabled || frameCapturedCallback != null || customCaptureCompletedCallback != null || isHdrSceneModeEnabled) cb else null, null
             )
             return true
         } catch (e: Exception) {
@@ -441,17 +481,20 @@ class Camera2ApiManager(context: Context) : CameraDevice.StateCallback() {
     }
 
     /**
-     * The "on" value written to the MediaTek HDR vendor tags: the single video HDR mode this
-     * HAL reports supporting (availableHdrModesVideo, falling back to availableVhdrModes),
-     * used verbatim rather than a hardcoded constant since neither tag's value space is
-     * documented publicly. Not verified on-device: whether 0 truly means "off" for hdrMode /
+     * The "on" value written to the MediaTek HDR vendor tags, and where it came from -- true when
+     * read from this camera's own availableHdrModesVideo/availableVhdrModes characteristic, false
+     * when neither is present and MTK_HDR_FALLBACK_ON_VALUE was used instead. Callers log
+     * differently depending on which happened, so the on-device log makes clear which path ran
+     * (on the Echo Show 5 target hardware, it's always the fallback -- see MtkHdrVendorTags).
+     *
+     * Not verified on-device either way: whether 0 truly means "off" for hdrMode /
      * SessionParamhdrMode is assumed by analogy with CONTROL_SCENE_MODE_DISABLED and other MTK
      * enum-style tags, not confirmed.
      */
-    private fun mtkHdrOnValue(characteristics: CameraCharacteristics): Int? {
-        characteristics.secureGet(MtkHdrVendorTags.availableHdrModesVideo)?.takeIf { it > 0 }?.let { return it }
-        characteristics.secureGet(MtkHdrVendorTags.availableVhdrModes)?.takeIf { it > 0 }?.let { return it }
-        return null
+    private fun mtkHdrOnValue(characteristics: CameraCharacteristics): Pair<Int, Boolean> {
+        characteristics.secureGet(MtkHdrVendorTags.availableHdrModesVideo)?.takeIf { it > 0 }?.let { return it to true }
+        characteristics.secureGet(MtkHdrVendorTags.availableVhdrModes)?.takeIf { it > 0 }?.let { return it to true }
+        return MTK_HDR_FALLBACK_ON_VALUE to false
     }
 
     /**
@@ -473,11 +516,16 @@ class Camera2ApiManager(context: Context) : CameraDevice.StateCallback() {
             return
         }
         val value = if (enabled) {
-            mtkHdrOnValue(characteristics) ?: run {
-                Log.w(TAG, "MediaTek vendor hdrMode is available but no supported video HDR mode is reported " +
-                    "(availableHdrModesVideo/availableVhdrModes); skipping vendor key, standard scene mode only")
-                return
+            val (onValue, fromCharacteristic) = mtkHdrOnValue(characteristics)
+            if (fromCharacteristic) {
+                Log.i(TAG, "MediaTek vendor hdrMode on-value $onValue read from availableHdrModesVideo/availableVhdrModes")
+            } else {
+                Log.w(TAG, "MediaTek vendor hdrMode is an advertised request key but neither " +
+                    "availableHdrModesVideo nor availableVhdrModes reports a value on this device; " +
+                    "falling back to $onValue (the 'on' value availableHdrModesPhoto reports for the " +
+                    "sibling photo feature on this hardware) rather than skipping the set entirely")
             }
+            onValue
         } else 0
         try {
             builder.set(MtkHdrVendorTags.hdrMode, value)
@@ -502,11 +550,16 @@ class Camera2ApiManager(context: Context) : CameraDevice.StateCallback() {
             return null
         }
         val value = if (isHdrSceneModeEnabled) {
-            mtkHdrOnValue(characteristics) ?: run {
-                Log.w(TAG, "MediaTek vendor SessionParamhdrMode is available but no supported video HDR mode is " +
-                    "reported; leaving session parameters unset")
-                return null
+            val (onValue, fromCharacteristic) = mtkHdrOnValue(characteristics)
+            if (fromCharacteristic) {
+                Log.i(TAG, "MediaTek vendor SessionParamhdrMode on-value $onValue read from availableHdrModesVideo/availableVhdrModes")
+            } else {
+                Log.w(TAG, "MediaTek vendor SessionParamhdrMode is an advertised session key but neither " +
+                    "availableHdrModesVideo nor availableVhdrModes reports a value on this device; " +
+                    "falling back to $onValue (the 'on' value availableHdrModesPhoto reports for the " +
+                    "sibling photo feature on this hardware) rather than leaving session parameters unset")
             }
+            onValue
         } else 0
         return try {
             val paramsBuilder = cameraDevice.createCaptureRequest(CameraDevice.TEMPLATE_RECORD)
@@ -647,6 +700,11 @@ class Camera2ApiManager(context: Context) : CameraDevice.StateCallback() {
         // rebuildSessionIfMtkHdrIsSessionOnly() below for the session-only variant. Both are
         // no-ops on a device that doesn't report the corresponding vendor key.
         applyMtkHdrRequestKey(builderInputSurface, true)
+        // Set true before applyRequest(), not after: applyRequest()'s own cb-install condition
+        // reads isHdrSceneModeEnabled to decide whether to attach the capture callback that logs
+        // hdrDetectionResult, so the flag must already be true on this call for that log to start
+        // on the very first enable rather than one setRepeatingRequest call later.
+        isHdrSceneModeEnabled = true
         isHdrSceneModeEnabled = applyRequest(builderInputSurface)
         rebuildSessionIfMtkHdrIsSessionOnly()
         return isHdrSceneModeEnabled
@@ -932,6 +990,22 @@ class Camera2ApiManager(context: Context) : CameraDevice.StateCallback() {
             result: TotalCaptureResult
         ) {
             customCaptureCompletedCallback?.invoke(session, request, result)
+
+            // com.mediatek.hdrfeature.hdrDetectionResult: read-only, so no availability check is
+            // needed before get() -- an unsupported CaptureResult key simply returns null. Only
+            // logged while HDR is actually enabled, and only every MTK_HDR_DETECTION_LOG_EVERY_N_FRAMES
+            // frames, to confirm engagement from the HAL's own reporting without flooding logcat.
+            // Placed before the STATISTICS_FACES early-return below so it still runs on hardware
+            // that isn't also doing face detection.
+            if (isHdrSceneModeEnabled) {
+                mtkHdrDetectionLogFrameCounter++
+                if (mtkHdrDetectionLogFrameCounter % MTK_HDR_DETECTION_LOG_EVERY_N_FRAMES == 0) {
+                    val detection = try { result.get(MtkHdrVendorTags.hdrDetectionResult) } catch (_: Exception) { null }
+                    if (detection != null) {
+                        Log.i(TAG, "MediaTek vendor com.mediatek.hdrfeature.hdrDetectionResult = $detection")
+                    }
+                }
+            }
 
             val faces = result.get(CaptureResult.STATISTICS_FACES) ?: return
             faceDetectorCallback?.onGetFaces(
