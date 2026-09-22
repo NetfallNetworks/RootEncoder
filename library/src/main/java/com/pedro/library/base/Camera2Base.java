@@ -234,6 +234,26 @@ public abstract class Camera2Base {
     }
 
     /**
+     * Enable the standard CONTROL_SCENE_MODE_HDR scene mode (android.control.availableSceneModes
+     * value 18), when the device's camera reports it as available.
+     * Warning: this forces CONTROL_MODE to USE_SCENE_MODE, which hands AE/AWB behaviour to the
+     * scene mode implementation -- manual exposure/white-balance calls may be overridden while
+     * this is enabled.
+     * @return true if success, false if fail (not supported or called before start camera)
+     */
+    public boolean enableHdrSceneMode() {
+        return cameraManager.enableHdrSceneMode();
+    }
+
+    public void disableHdrSceneMode() {
+        cameraManager.disableHdrSceneMode();
+    }
+
+    public boolean isHdrSceneModeEnabled() {
+        return cameraManager.isHdrSceneModeEnabled();
+    }
+
+    /**
      * Use getCameraFacing instead
      */
     @Deprecated
